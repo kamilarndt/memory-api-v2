@@ -197,33 +197,61 @@ async def resolve_entities(
     _: None = Depends(verify_token),
 ):
     """Identify and merge entities whose names are identical (case-folded) or
-    have high pg_trgm similarity (>0.8).  Keeps the lower entity_id, migrates
-    all fact_entity_links, and deletes the duplicate.
+    have high pg_trgm similarity (>0.8). Safe version with existence checks.
     """
-    rows = await db.fetch(
-        """
-        SELECT e1.entity_id AS id1, e2.entity_id AS id2,
-               e1.name AS n1, e2.name AS n2
-        FROM entities e1
-        JOIN entities e2 ON e1.entity_id < e2.entity_id
-        WHERE LOWER(e1.name) = LOWER(e2.name)
-           OR similarity(e1.name, e2.name) > 0.8
-        LIMIT 50
-        """
-    )
+    try:
+        # Ensure pg_trgm extension
+        await db.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
 
-    merged = 0
-    for r in rows:
-        # Migrate links from id2 -> id1
-        await db.execute(
-            "UPDATE fact_entity_links SET entity_id = $1 WHERE entity_id = $2",
-            r["id1"], r["id2"],
+        # Check if entities table exists
+        table_exists = await db.fetchval(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'entities')"
         )
-        await db.execute("DELETE FROM entities WHERE entity_id = $1", r["id2"])
-        merged += 1
+        if not table_exists:
+            logger.warning("Table 'entities' does not exist. Skipping entity resolution.")
+            return {"status": "skipped", "reason": "entities_table_missing", "resolved": 0, "merged": 0}
 
-    logger.info("Entity resolution: %d entities merged", merged)
-    return {"status": "ok", "resolved": len(rows), "merged": merged}
+        rows = await db.fetch(
+            """
+            SELECT e1.entity_id AS id1, e2.entity_id AS id2,
+                   e1.name AS n1, e2.name AS n2
+            FROM entities e1
+            JOIN entities e2 ON e1.entity_id < e2.entity_id
+            WHERE LOWER(e1.name) = LOWER(e2.name)
+               OR similarity(e1.name, e2.name) > 0.8
+            LIMIT 30
+            """
+        )
+
+        merged = 0
+        for r in rows:
+            try:
+                # Migrate links from id2 -> id1
+                await db.execute(
+                    "UPDATE fact_entity_links SET entity_id = $1 WHERE entity_id = $2",
+                    r["id1"], r["id2"],
+                )
+                await db.execute("DELETE FROM entities WHERE entity_id = $1", r["id2"])
+                merged += 1
+            except Exception as e:
+                logger.warning("Failed to merge entities %s and %s: %s", r["n1"], r["n2"], e)
+
+        logger.info("Entity resolution: %d entities merged", merged)
+        return {
+            "status": "ok",
+            "resolved": len(rows),
+            "merged": merged,
+            "note": "Safe entity resolution completed"
+        }
+
+    except Exception as e:
+        logger.error("Entity resolution failed: %s", e)
+        return {
+            "status": "error",
+            "error": str(e),
+            "resolved": 0,
+            "merged": 0
+        }
 
 
 # ── Purge ────────────────────────────────────────────────────────────────────
