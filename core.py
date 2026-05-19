@@ -38,10 +38,14 @@ class Config:
 
     @property
     def dsn(self) -> str:
-        return (
-            f"postgresql://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}"
-        )
+        pw = self.db_password
+        return f"postgresql://{self.db_user}:{pw}@{self.db_host}:{self.db_port}/{self.db_name}"
+
+    @property
+    def dsn_display(self) -> str:
+        """For logging — mask the password."""
+        pw = "***" if self.db_password else ""
+        return f"postgresql://{self.db_user}:{pw}@{self.db_host}:{self.db_port}/{self.db_name}"
 
     @property
     def is_dev(self) -> bool:
