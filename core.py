@@ -30,7 +30,10 @@ class Config:
     gemini_key: str = field(default_factory=lambda: os.environ.get("GEMINI_EMBED_KEY", ""))
     ollama_url: str = field(default_factory=lambda: os.environ.get("OLLAMA_URL", "http://localhost:11434"))
     embed_model: str = field(default_factory=lambda: os.environ.get("EMBED_MODEL", "nomic-embed-text"))
-    embed_dim: int = field(default_factory=lambda: int(os.environ.get("EMBED_DIM", "3072")))
+    embed_dim: int = field(default_factory=lambda: int(os.environ.get("EMBED_DIM", "1536")))
+    router_key: str = field(default_factory=lambda: os.environ.get("ROUTER_API_KEY", "sk-rtr-78770c19-d6c7-4fa8-b083-49346a367ec1"))
+    router_url: str = field(default_factory=lambda: os.environ.get("ROUTER_URL", "http://127.0.0.1:18881/v1"))
+    router_model: str = field(default_factory=lambda: os.environ.get("ROUTER_EMBED_MODEL", "openai/text-embedding-3-small"))
 
     def __post_init__(self):
         if not isinstance(self.db_port, int):
@@ -151,9 +154,10 @@ embedding_breaker = CircuitBreaker()
 # ── Embedding ────────────────────────────────────────────────────────────────
 
 async def get_embedding(text: str, config: Optional[Config] = None) -> Optional[list[float]]:
-    """Get embedding vector from Gemini (gemini-embedding-001, 3072d).
+    """Get embedding vector from Router (primary, 1536d) with Gemini fallback.
 
-    Ollama fallback if Gemini key is not available.
+    Chain: Router → Gemini → OpenRouter → Ollama
+    Router provides 1536d embeddings via OpenAI-compatible endpoint.
     """
     config = config or get_config()
 
@@ -161,7 +165,29 @@ async def get_embedding(text: str, config: Optional[Config] = None) -> Optional[
         logger.debug("Embedding circuit breaker is open, skipping")
         return None
 
-    # Strategy 1: Gemini (3072d raw → output_dimensionality=1024 to match DB)
+    # Strategy 1: Router (OpenAI-compatible, 1536d)
+    if config.router_key:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{config.router_url}/embeddings",
+                    headers={"Authorization": f"Bearer {config.router_key}"},
+                    json={"model": config.router_model, "input": text, "dimensions": 1024},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                emb = data.get("data", [{}])[0].get("embedding")
+                if emb:
+                    embedding_breaker.record_success()
+                    # Truncate to 1024d to match DB schema
+                    if len(emb) > 1024:
+                        emb = emb[:1024]
+                    return emb
+        except Exception as e:
+            logger.warning("Router embedding failed: %s", e)
+            embedding_breaker.record_failure()
+
+    # Strategy 2: Gemini (3072d raw → output_dimensionality=1536 to match DB)
     if config.gemini_key:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -170,7 +196,7 @@ async def get_embedding(text: str, config: Optional[Config] = None) -> Optional[
                     json={
                         "model": "models/gemini-embedding-001",
                         "content": {"parts": [{"text": text}]},
-                        "output_dimensionality": 1024,
+                        "output_dimensionality": 1536,
                     },
                 )
                 resp.raise_for_status()
@@ -183,7 +209,7 @@ async def get_embedding(text: str, config: Optional[Config] = None) -> Optional[
             logger.warning("Gemini embedding failed: %s", e)
             embedding_breaker.record_failure()
 
-    # Strategy 2: OpenRouter (baai/bge-m3, 1024d)
+    # Strategy 3: OpenRouter (baai/bge-m3, 1024d)
     if config.openrouter_key:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -197,11 +223,14 @@ async def get_embedding(text: str, config: Optional[Config] = None) -> Optional[
                 emb = data.get("data", [{}])[0].get("embedding")
                 if emb:
                     embedding_breaker.record_success()
+                    # Truncate to 1024d to match DB schema
+                    if len(emb) > 1024:
+                        emb = emb[:1024]
                     return emb
         except Exception as e:
             logger.warning("OpenRouter embedding failed: %s", e)
 
-    # Strategy 3: Ollama fallback
+    # Strategy 4: Ollama fallback
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(

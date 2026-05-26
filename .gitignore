@@ -1,5 +1,10 @@
 venv/
+.venv/
 __pycache__/
 .env
+.env.example
 *.pyc
 .DS_Store
+memory.db
+*.log
+todos.md

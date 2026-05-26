@@ -26,16 +26,23 @@ Centralny system pamięci dla wszystkich agentów AI na WSL2:
 │  ├── memories.py    │  config/dataclass  │  ├── queue.py      │
 │  ├── profiles.py    │  auth middleware   │  └── extract.py    │
 │  ├── admin.py       │  circuit breaker   └────────────────────┘
-│  └── hygiene.py     │  embedding cache                        │
+│  ├── hygiene.py      │  embedding cache                        │
+│  ├── relations.py   │  Memory graph relations                 │
+│  └── setup.py       │  FTS initialization                     │
+│                     │  services/                              │
+│                     │  └── dream.py    — DreamService (6 stages)│
+│                     │  db.py (asyncpg pool)                   │
+│                     │  entities.py (resolution)               │
 │                     │  db.py (asyncpg pool)                   │
 │                     │  entities.py (resolution)               │
 ├─────────────────────┼────────────────────┼────────────────────┤
 │  PostgreSQL (pgmemory) — główna baza                          │
-│  ├── memories          — 1191+ records, vector(1024)        │
+│  ├── memories          — 1193+ records, vector(1536)       │
 │  ├── entities          — entity registry                    │
 │  ├── entity_aliases    — entity resolution                  │
 │  ├── fact_entity_links — memory ↔ entity (M2M)             │
 │  ├── memory_feedback   — trust scoring                      │
+│  ├── memory_relations  — graph relations between memories   │
 │  ├── user_profiles     — cross-session user models          │
 │  └── daily_stats       — snapshots statystyk              │
 ├──────────────────────────────────────────────────────────────┤
@@ -81,6 +88,25 @@ Centralny system pamięci dla wszystkich agentów AI na WSL2:
 | GET | `/profiles/{user_id}` | Pojedynczy profil | optional |
 | POST | `/profiles/{user_id}` | Create/update (JSONB merge) | optional |
 
+### Relations (Graph)
+| Metoda | Endpoint | Opis | Auth |
+|--------|----------|------|------|
+| POST | `/memories/{id}/relations` | Create relation between two memories | optional |
+| GET | `/memories/{id}/relations` | List relations (in + out) | optional |
+| DELETE | `/memories/{id}/relations/{rid}` | Delete a relation | optional |
+| GET | `/memories/{id}/relations/graph` | BFS traversal up to depth levels | optional |
+
+### Dream Service
+| Metoda | Endpoint | Opis | Auth |
+|--------|----------|------|------|
+| POST | `/api/dream/run` | Run full dream cycle (6 stages) | optional |
+| GET | `/api/dream/status` | Current dream state + stats | optional |
+
+### Setup
+| Metoda | Endpoint | Opis | Auth |
+|--------|----------|------|------|
+| POST | `/api/setup/fts` | Initialize Polish FTS (unaccent + trigram) | optional |
+
 ### Admin & Hygiene
 | Metoda | Endpoint | Opis | Auth |
 |--------|----------|------|------|
@@ -88,6 +114,7 @@ Centralny system pamięci dla wszystkich agentów AI na WSL2:
 | GET | `/stats` | Basic stats (active count) | optional |
 | GET | `/memories/stats` | Enhanced stats (by agent/project/category) | optional |
 | POST | `/memories/decay` | Temporal decay: `trust * 0.5^(age/365)` | optional |
+| POST | `/memories/expire` | Archive expired memories (past expires_at) | optional |
 | POST | `/extract-facts` | LLM auto-extract facts z tekstu | optional |
 | POST | `/memories/{id}/feedback` | Feedback → trust_score update | optional |
 | POST | `/hygiene/run` | Full hygiene cycle (contradictions) | optional |
@@ -106,13 +133,14 @@ Centralny system pamięci dla wszystkich agentów AI na WSL2:
 
 ### memories
 ```sql
-id UUID PK, content TEXT NOT NULL, embedding vector(1024),
+id UUID PK, content TEXT NOT NULL, embedding vector(1536), 
 agent_id VARCHAR(64), project_id VARCHAR(128), user_id VARCHAR(128),
 category VARCHAR(32), tags TEXT[], metadata JSONB, source_file VARCHAR(512),
 created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ,
 trust_score REAL, importance REAL, archived_at TIMESTAMPTZ,
 entities JSONB, linked_ids TEXT, access_count INTEGER,
-memory_type VARCHAR(32), contradictions JSONB
+memory_type VARCHAR(32), contradictions JSONB,
+expires_at TIMESTAMPTZ    -- TTL; NULL = never expires
 ```
 
 ### entities
@@ -180,6 +208,7 @@ Hermes cronjob wywołuje endpointy w nocy gdy nikt nie pracuje na WSL2.
 
 | Czas | Operacja | Endpoint | Opis |
 |------|----------|----------|------|
+| 01:30 | Expire | `POST /memories/expire` | Archive memories past expires_at |
 | 02:00 | Decay | `POST /memories/decay` | `trust_score *= 0.5^(age/365)` dla < 0.8 |
 | 02:30 | Contradiction | `POST /hygiene/run` | Znajdź sprzeczne fakty (shared entities + low similarity) |
 | 03:00 | Entity Resolution | `POST /entities/resolve` | Merge duplicates z aliases |
@@ -230,11 +259,15 @@ memory-api-v2/
 ├── db.py                  # asyncpg pool, init schema
 ├── embeddings.py          # Embedding cache (content_hash → vector)
 ├── entities.py            # Entity resolution + aliases
+├── services/
+│   └── dream.py           # DreamService orchestrator (6 stages)
 ├── routes/
 │   ├── memories.py        # CRUD + search endpoints
 │   ├── profiles.py        # User profiles
-│   ├── admin.py           # Health, stats, extract-facts
-│   └── hygiene.py         # Contradictions, trust, decay, purge
+│   ├── admin.py           # Health, stats, extract-facts, expire
+│   ├── hygiene.py         # Contradictions, trust, decay, purge
+│   ├── relations.py       # Memory graph relations CRUD + BFS
+│   └── setup.py           # FTS initialization
 ├── workers/
 │   ├── queue.py           # SQLite write queue → PG flush
 │   └── extract.py         # Async fact extraction
@@ -249,6 +282,6 @@ memory-api-v2/
 
 ---
 
-*Autor: Budy*
-*Data: 2026-05-12*
-*Status: Design — w trakcie implementacji*
+*Autor: Budy / Hermes*
+*Data: 2026-05-22*
+*Status: Wdrożone — wszystkie fazy M1-M2 kompletne, aktywnie rozwijane*

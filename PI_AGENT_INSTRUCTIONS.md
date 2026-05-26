@@ -1,6 +1,6 @@
 # Memory API v2 — Instrukcja dla Pi Agenta
 
-**Data:** 2026-05-12  
+**Data:** 2026-05-22  
 **Autor:** Budy
 
 ---
@@ -18,8 +18,8 @@
 
 ### Nie musisz zmieniać:
 - **URL bazy** — dalej ta sama `pgmemory`, wszystkie rekordy (1191+) są
-- **Embedding dimension** — dalej 1024d (teraz z Gemini zamiast Ollama)
-- **API endpointy** — te same nazwy, ten sam port 8765
+- **Embedding dimension** — 1536d (Router → Gemini → OpenRouter → Ollama)
+- **API endpointy** — te same nazwy + nowe (relations, dream, expire, setup)
 
 ---
 
@@ -42,11 +42,20 @@
 | `DELETE /memories/purge` | Archive low-trust + delete old archived |
 | `GET /profiles` | User profiles CRUD |
 | `GET /memories/stats` | Enhanced stats (by agent/project/category) |
+| `POST /memories/{id}/relations` | Create graph relation between memories |
+| `GET /memories/{id}/relations` | List relations for a memory |
+| `GET /memories/{id}/relations/graph` | Traverse relation graph up to depth levels |
+| `DELETE /memories/{id}/relations/{rid}` | Delete a relation |
+| `POST /memories/expire` | Archive expired memories (TTL) |
+| `POST /api/dream/run` | Run full memory consolidation cycle |
+| `GET /api/dream/status` | Dream cycle status and stats |
+| `POST /api/setup/fts` | Initialize Polish FTS (unaccent + trigram) |
 
-### 2. Gemini Embedding (primary)
-- Primary: `gemini-embedding-001` (Google) → 1024d (`output_dimensionality=1024`)
-- Fallback: OpenRouter (`baai/bge-m3`)
-- Ostatni fallback: Ollama (`nomic-embed-text`)
+### 2. Router Embedding (primary)
+- Primary: Router (localhost:18881, `openai/text-embedding-3-small`) → 1536d
+- Fallback: Gemini (`gemini-embedding-001`, `output_dimensionality=1536`)
+- Fallback 2: OpenRouter (`openai/text-embedding-3-small`)
+- Last: Ollama (`nomic-embed-text`)
 - Circuit breaker: 5 faili → 120s cooldown → auto-recover
 
 ### 3. Auth
@@ -103,6 +112,17 @@ curl -s -X POST http://localhost:8765/memories/{memory_id}/feedback \
 curl -s http://localhost:8765/memories/stats
 ```
 
+### Dodaj relację między faktami
+```bash
+curl -s -X POST "http://localhost:8765/memories/{memory_id}/relations?target_id={other_id}&relation_type=support" \
+  -H "Content-Type: application/json"
+```
+
+### Zobacz graf relacji
+```bash
+curl -s "http://localhost:8765/memories/{memory_id}/relations/graph?depth=2"
+```
+
 ---
 
 ## Schema bazy (memories)
@@ -110,7 +130,7 @@ curl -s http://localhost:8765/memories/stats
 ```
 id UUID PK
 content TEXT NOT NULL
-embedding vector(1024)
+embedding vector(1536)
 agent_id VARCHAR(64)      -- 'pi-agent', 'budy', 'claude'
 project_id VARCHAR(128)   -- 'ubekv2', '' = general
 user_id VARCHAR(128)      -- 'kamil', 'rafal', ...
@@ -128,6 +148,7 @@ linked_ids TEXT           -- ['uuid1', 'uuid2']
 access_count INTEGER      -- ile razy retrieved
 memory_type VARCHAR(32)   -- 'factual', 'preference', 'lesson', etc.
 contradictions JSONB      -- flagged contradictions
+expires_at TIMESTAMPTZ    -- TTL; NULL = never expires
 ```
 
 ---
@@ -142,8 +163,14 @@ contradictions JSONB      -- flagged contradictions
 ## Status
 - ✅ Server: PID 30001, port 8765
 - ✅ Baza: `pgmemory` (1191+ rekordów)
-- ✅ Embedding: Gemini (1024d)
-- ✅ Cron: decay, hygiene, stats snapshot
+- ✅ Embedding: Router (1536d, openai/text-embedding-3-small)
+- ✅ Relacje grafowe: memory_relations CRUD + BFS traversal
+- ✅ DreamService: 6-stage consolidation (LINK→CONSOLIDATE→REFLECT→DECAY→BUDGET→EXPIRE)
+- ✅ Expire: per-fact TTL (`expires_in_hours`) + auto-archiwizacja
+- ✅ Polish FTS: unaccent + pg_trgm + tsvector
+- ✅ Inline dedup: merguj, nie odrzucaj duplikatów
+- ✅ Auto-extract: LLM entities przy `extract: true`
+- ✅ Cron: decay, expire, hygiene, stats snapshot
 - ✅ Auth: dev mode (no token required)
 
 ---

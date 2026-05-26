@@ -8,6 +8,7 @@ import uuid
 from typing import Optional
 
 import asyncpg
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core import Config, get_config, get_embedding, verify_token
@@ -33,6 +34,9 @@ class AddMemoryRequest(BaseModel):
     importance: float = 0.5
     memory_type: str = "factual"
     pi_memory_key: str = ""  # e.g. "pref.commit_style", "lesson.dont_use_echo"
+    session_id: Optional[str] = None
+    expires_in_hours: Optional[int] = None  # TTL; None = never expires
+    extract: bool = False  # auto-extract entities via LLM on save
 
 
 class SearchRequest(BaseModel):
@@ -42,6 +46,7 @@ class SearchRequest(BaseModel):
     category: Optional[str] = None
     limit: int = 5
     cross_agent: bool = True
+    compact: bool = False  # compact results (no content/excerpt)
 
 
 class CompositionalSearchRequest(BaseModel):
@@ -104,6 +109,24 @@ async def _check_duplicate(
     return row["id"] if row else None
 
 
+async def _find_by_pi_key(
+    db: asyncpg.Connection,
+    pi_memory_key: str,
+    agent_id: str,
+    project_id: str,
+) -> Optional[str]:
+    """Return existing memory ID if pi_memory_key match found."""
+    if not pi_memory_key:
+        return None
+    row = await db.fetchrow(
+        "SELECT id FROM memories "
+        "WHERE pi_memory_key = $1 AND agent_id = $2 AND project_id = $3 AND archived_at IS NULL "
+        "LIMIT 1",
+        pi_memory_key, agent_id, project_id,
+    )
+    return row["id"] if row else None
+
+
 # ── CRUD ─────────────────────────────────────────────────────────────────────
 
 @router.post("", summary="Add a memory")
@@ -117,10 +140,45 @@ async def add_memory(
     if not emb:
         raise HTTPException(500, "Embedding generation failed")
 
-    # Dedup check
+    # ── Upsert by pi_memory_key (before semantic dedup) ──────────────
+    if req.pi_memory_key:
+        existing = await _find_by_pi_key(db, req.pi_memory_key, req.agent_id, req.project_id)
+        if existing:
+            await db.execute(
+                """UPDATE memories SET
+                   content = $1,
+                   session_id = COALESCE($2, session_id),
+                   updated_at = NOW(),
+                   access_count = COALESCE(access_count, 0) + 1
+                   WHERE id = $3""",
+                req.content, req.session_id, existing,
+            )
+            if req.expires_in_hours:
+                await db.execute(
+                    "UPDATE memories SET expires_at = NOW() + make_interval(hours => $1) WHERE id = $2",
+                    req.expires_in_hours, existing,
+                )
+            return {"status": "updated", "id": str(existing), "revision": True}
+
+    # Dedup check — merge instead of reject
     existing = await _check_duplicate(db, emb)
     if existing:
-        return {"status": "duplicate", "existing_id": str(existing), "similarity": 0.95}
+        await db.execute(
+            """UPDATE memories SET
+               content = $1,
+               session_id = COALESCE($2, session_id),
+               updated_at = NOW(),
+               access_count = COALESCE(access_count, 0) + 1
+               WHERE id = $3""",
+            req.content, req.session_id, existing,
+        )
+        # Update expires_at if requested
+        if req.expires_in_hours:
+            await db.execute(
+                "UPDATE memories SET expires_at = NOW() + make_interval(hours => $1) WHERE id = $2",
+                req.expires_in_hours, existing,
+            )
+        return {"status": "updated", "id": str(existing), "agent_id": req.agent_id}
 
     mid = str(uuid.uuid4())
     es = _emb_str(emb)
@@ -128,11 +186,43 @@ async def add_memory(
     await db.execute(
         """INSERT INTO memories
            (id, content, embedding, agent_id, project_id, user_id, category, tags,
-            importance, memory_type, pi_memory_key, created_at)
-           VALUES ($1, $2, $3::vector, $4, $5, $6, $7, $8, $9, $10, $11, NOW())""",
+            importance, memory_type, pi_memory_key, session_id, expires_at, created_at)
+           VALUES ($1, $2, $3::vector, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                   CASE WHEN $13::int IS NOT NULL THEN NOW() + make_interval(hours => $13) ELSE NULL END,
+                   NOW())""",
         mid, req.content, es, req.agent_id, req.project_id,
-        req.user_id, req.category, req.tags, req.importance, req.memory_type, req.pi_memory_key,
+        req.user_id, req.category, req.tags, req.importance, req.memory_type,
+        req.pi_memory_key, req.session_id, req.expires_in_hours,
     )
+
+    # Auto-extract entities via LLM if requested
+    if req.extract and req.content:
+        config = get_config()
+        if config.openrouter_key:
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {config.openrouter_key}"},
+                        json={
+                            "model": "openai/gpt-4o-mini:free",
+                            "messages": [
+                                {"role": "system", "content": "Extract key entities (people, places, concepts, projects) from this text. Return ONLY a JSON array of strings."},
+                                {"role": "user", "content": req.content},
+                            ],
+                            "max_tokens": 200,
+                        },
+                    )
+                    text = resp.json()["choices"][0]["message"]["content"].strip()
+                    if text.startswith("["):
+                        entities = json.loads(text)
+                        if entities:
+                            await db.execute(
+                                "UPDATE memories SET entities = $1::jsonb WHERE id = $2",
+                                json.dumps(entities), mid,
+                            )
+            except Exception as e:
+                logger.warning("Auto-extract failed: %s", e)
 
     return {"status": "added", "id": mid, "agent_id": req.agent_id}
 
@@ -238,6 +328,68 @@ async def delete_memory(
     return {"status": "archived", "memory_id": memory_id}
 
 
+# ── Full Memory Detail ───────────────────────────────────────────────────────
+
+@router.get("/{memory_id}/full", summary="Get full memory detail (public)")
+async def get_memory_full(
+    memory_id: str,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """Return full record (without embedding/tsv) plus relations_count. Public endpoint."""
+    row = await db.fetchrow(
+        """SELECT id, content, agent_id, project_id, user_id, category, tags,
+                  source_file, importance, trust_score, memory_type, pi_memory_key,
+                  session_id, entities, access_count, expires_at, created_at, updated_at,
+                  archived_at, memory_relations_count
+           FROM memories
+           WHERE id = $1""",
+        memory_id,
+    )
+    if not row:
+        raise HTTPException(404, "Memory not found")
+    return {"memory": _serialize_row(dict(row))}
+
+
+# ── Compact List ─────────────────────────────────────────────────────────────
+
+@router.get("/compact", summary="List memories compact (public)")
+async def list_memories_compact(
+    agent_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    memory_type: Optional[str] = Query(None),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """List memories with compact fields only. Public endpoint. Sorted by created_at DESC."""
+    wheres = ["archived_at IS NULL"]
+    params: list = []
+    i = 1
+
+    for col, val in [("agent_id", agent_id), ("project_id", project_id),
+                     ("memory_type", memory_type)]:
+        if val:
+            wheres.append(f"{col} = ${i}")
+            params.append(val)
+            i += 1
+
+    where = " AND ".join(wheres)
+    params.extend([limit, offset])
+
+    rows = await db.fetch(
+        f"SELECT id, pi_memory_key, memory_type, importance, created_at "
+        f"FROM memories WHERE {where} ORDER BY created_at DESC LIMIT ${i} OFFSET ${i+1}",
+        *params,
+    )
+    results = []
+    for r in rows:
+        d = dict(r)
+        if d.get("pi_memory_key") is None:
+            d["pi_memory_key"] = ""
+        results.append(d)
+    return {"memories": results, "count": len(results)}
+
+
 # ── Search ───────────────────────────────────────────────────────────────────
 
 search_router = APIRouter(tags=["search"])
@@ -279,14 +431,16 @@ async def search_memories(
         ),
         keyword_search AS (
             SELECT m.id,
-                   ROW_NUMBER() OVER (ORDER BY ts_rank(m.tsv, websearch_to_tsquery('simple', ${i+1})) DESC) as rank
+                   ROW_NUMBER() OVER (ORDER BY ts_rank(m.tsv, websearch_to_tsquery('english', ${i+1})) DESC) as rank
             FROM memories m
-            WHERE m.tsv @@ websearch_to_tsquery('simple', ${i+1})
+            WHERE (m.tsv @@ websearch_to_tsquery('english', ${i+1})
+                   OR similarity(m.content, ${i+1}) > 0.3)
               AND {where}
             LIMIT 50
         )
         SELECT m.id, m.content, m.category, m.agent_id, m.project_id, m.user_id,
                m.tags, m.source_file, m.importance, m.trust_score, m.memory_type, m.created_at,
+               m.pi_memory_key,
                (COALESCE(1.0 / (60 + s.rank), 0.0) + COALESCE(1.0 / (60 + k.rank), 0.0)) as rrf_score
         FROM semantic_search s
         FULL OUTER JOIN keyword_search k ON s.id = k.id
@@ -300,9 +454,21 @@ async def search_memories(
     results = []
     for r in rows:
         d = dict(r)
-        d["excerpt"] = (d["content"][:300] + "..." if len(d["content"]) >= 300 else d["content"])
         d["confidence"] = round(float(d.pop("rrf_score")), 4)
-        results.append(d)
+
+        if req.compact:
+            # Compact mode: only id, pi_memory_key, memory_type, confidence, created_at
+            results.append({
+                "id": d["id"],
+                "pi_memory_key": d.get("pi_memory_key") or "",
+                "memory_type": d["memory_type"],
+                "confidence": d["confidence"],
+                "created_at": d["created_at"],
+            })
+        else:
+            # Full mode (existing behavior)
+            d["excerpt"] = (d["content"][:300] + "..." if len(d["content"]) >= 300 else d["content"])
+            results.append(d)
 
     return {"results": results, "count": len(results)}
 

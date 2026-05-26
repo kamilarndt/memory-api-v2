@@ -167,19 +167,29 @@ async def run_hygiene(
         }
         contradictions.append(pair)
 
-        # Flag both sides
-        await db.execute(
-            "UPDATE memories "
-            "SET contradictions = COALESCE(contradictions, '[]'::jsonb) || $1::jsonb "
-            "WHERE id = $2",
-            f'["{r["id2"]}"]', str(r["id1"]),
-        )
-        await db.execute(
-            "UPDATE memories "
-            "SET contradictions = COALESCE(contradictions, '[]'::jsonb) || $1::jsonb "
-            "WHERE id = $2",
-            f'["{r["id1"]}"]', str(r["id2"]),
-        )
+        # Flag both sides — ensure contradictions column exists
+        try:
+            await db.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS contradictions jsonb DEFAULT '[]'::jsonb")
+        except Exception:
+            pass  # column may already exist
+        try:
+            await db.execute(
+                "UPDATE memories "
+                "SET contradictions = COALESCE(contradictions, '[]'::jsonb) || $1::jsonb "
+                "WHERE id = $2",
+                f'["{r["id2"]}"]', str(r["id1"]),
+            )
+        except Exception as e:
+            logger.warning("Failed to flag contradiction for %s: %s", r["id1"], e)
+        try:
+            await db.execute(
+                "UPDATE memories "
+                "SET contradictions = COALESCE(contradictions, '[]'::jsonb) || $1::jsonb "
+                "WHERE id = $2",
+                f'["{r["id1"]}"]', str(r["id2"]),
+            )
+        except Exception as e:
+            logger.warning("Failed to flag contradiction for %s: %s", r["id2"], e)
 
     logger.info("Contradiction detection: %d pairs found", len(contradictions))
     return {
@@ -278,7 +288,7 @@ async def purge_memories(
           AND (
             (trust_score IS NOT NULL
              AND trust_score < $1
-             AND created_at < NOW() - ($2 || ' days')::interval)
+             AND created_at < NOW() - ($2::text || ' days')::interval)
             OR
             (access_count = 0
              AND created_at < NOW() - 180 * interval '1 day')

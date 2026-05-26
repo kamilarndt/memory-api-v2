@@ -21,6 +21,11 @@ from routes.admin import router as admin_router
 from routes.profiles import router as profiles_router
 from routes.hygiene import router as hygiene_router
 from routes.aliases import router as aliases_router
+from routes.setup import router as setup_router
+from routes.relations import router as relations_router
+from routes.sessions import router as sessions_router
+from routes.conflicts import router as conflicts_router
+from routes.prompts import router as prompts_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -250,6 +255,11 @@ app.include_router(hygiene_router)
 app.include_router(memories_router)
 app.include_router(search_router)
 app.include_router(aliases_router)
+app.include_router(setup_router)
+app.include_router(relations_router)
+app.include_router(sessions_router)
+app.include_router(conflicts_router)
+app.include_router(prompts_router)
 
 
 @app.get("/")

@@ -12,6 +12,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from core import embedding_breaker, get_config, get_embedding, verify_token
 from db import get_db
+from services.dream import run_full_cycle, get_dream_state
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +33,14 @@ async def health(db: asyncpg.Connection = Depends(get_db)):
     config = get_config()
 
     # Determine actual primary embedding provider
-    if config.gemini_key:
+    if config.router_key:
+        embed_provider = "router"
+        embed_model = config.router_model
+        embed_dim = config.embed_dim  # 1536
+    elif config.gemini_key:
         embed_provider = "gemini"
         embed_model = "gemini-embedding-001"
-        embed_dim = 1024  # output_dimensionality
+        embed_dim = 1536  # output_dimensionality
     elif config.openrouter_key:
         embed_provider = "openrouter"
         embed_model = "baai/bge-m3"
@@ -242,4 +247,55 @@ async def extract_facts(
         "saved": saved,
         "duplicates": duplicates,
         "facts": facts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. Dream endpoints — background memory consolidation
+# ---------------------------------------------------------------------------
+
+
+@router.post("/dream/run", summary="Run full dream consolidation cycle")
+async def run_dream(
+    db=Depends(get_db),
+    _: None = Depends(verify_token),
+):
+    """Run all 5 stages of dream consolidation in order."""
+    result = await run_full_cycle(db)
+    return result
+
+
+@router.post("/memories/expire", summary="Archive expired memories")
+async def expire_memories(
+    db=Depends(get_db),
+    _: None = Depends(verify_token),
+):
+    """Archive all memories past their expires_at."""
+    result = await db.execute(
+        "UPDATE memories SET archived_at = NOW() WHERE expires_at IS NOT NULL AND expires_at < NOW() AND archived_at IS NULL"
+    )
+    count = 0
+    if result and result.startswith("UPDATE"):
+        parts = result.split()
+        if len(parts) > 1:
+            try:
+                count = int(parts[-1])
+            except (ValueError, TypeError):
+                pass
+    return {"status": "ok", "expired": count}
+
+
+@router.get("/dream/status", summary="Get dream cycle status")
+async def dream_status(
+    _: None = Depends(verify_token),
+):
+    """Get current dream cycle state and last run stats."""
+    state = get_dream_state()
+    return {
+        "running": state.running,
+        "stage": state.stage,
+        "progress": state.progress,
+        "started_at": state.started_at,
+        "last_completed": state.last_completed,
+        "stats": state.stats,
     }

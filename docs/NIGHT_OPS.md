@@ -13,6 +13,12 @@ Hermes cronjob wywołuje endpointy Memory API v2 przez `curl`.
 **Co:** Stare fakty z niskim trust tracą jeszcze więcej. Ważne (trust ≥ 0.8) nie decay-ują.
 **Expected response:** `{"status": "ok", "updated_count": 45}`
 
+### 02:15 — Expire Memories
+**Endpoint:** `POST /memories/expire`
+**SQL:** `UPDATE memories SET archived_at = NOW() WHERE expires_at IS NOT NULL AND expires_at < NOW() AND archived_at IS NULL`
+**Co:** Archive memories past their `expires_at` (per-fact TTL set at creation)
+**Expected response:** `{"status": "ok", "expired": 3}`
+
 ### 02:30 — Contradiction Detection
 **Endpoint:** `POST /hygiene/run`
 **Co:** Znajduje pary faktów które:
@@ -88,7 +94,8 @@ cronjob(action='create',
 ## Przykładowy Log
 
 ```
-2026-05-13 02:00:00 | POST /memories/decay | status=ok | updated=45 | 120ms
+2026-05-22 02:00:00 | POST /memories/decay | status=ok | updated=45 | 120ms
+2026-05-22 02:15:00 | POST /memories/expire | status=ok | expired=3 | 30ms
 2026-05-13 02:30:00 | POST /hygiene/run | status=ok | contradictions=3 | 450ms
 2026-05-13 03:00:00 | POST /entities/resolve | status=ok | resolved=5 | 300ms
 2026-05-13 03:30:00 | POST /hygiene/trust | status=ok | updated=120 | 200ms
