@@ -25,6 +25,8 @@ import asyncpg
 import httpx
 
 from core import get_config, get_embedding
+from repositories.memory import MemoryRepository
+from repositories.prompts import MERGE_FACTS_SYSTEM, REFLECT_SYSTEM
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +72,7 @@ async def _llm_merge(content1: str, content2: str, config) -> Optional[str]:
                     "messages": [
                         {
                             "role": "system",
-                            "content": (
-                                "Merge these two similar facts into one concise combined fact. "
-                                "Return ONLY the merged text, no preamble or explanation."
-                            ),
+                            "content": MERGE_FACTS_SYSTEM,
                         },
                         {"role": "user", "content": f"Fact 1: {content1}\nFact 2: {content2}"},
                     ],
@@ -106,12 +105,7 @@ async def _llm_reflect(contents: list[str], config) -> list[str]:
                     "messages": [
                         {
                             "role": "system",
-                            "content": (
-                                "Based on these memories, identify 2-3 high-level patterns, "
-                                "preferences, or insights about this user. "
-                                "Return ONLY a JSON array of strings, nothing else. "
-                                'Example: ["Prefers minimalist design", "Often works late at night"]'
-                            ),
+                            "content": REFLECT_SYSTEM,
                         },
                         {"role": "user", "content": f"Memories:\n{contents_str}"},
                     ],
@@ -187,7 +181,7 @@ async def stage_consolidate(db: asyncpg.Connection, max_merges: int = 20) -> int
             # Re-embed the merged content
             emb = await get_embedding(merged, config)
             if emb:
-                es = f"[{','.join(map(str, emb))}]"
+                es = MemoryRepository.format_vector(emb)
                 # Update first memory with merged content + new embedding
                 await db.execute(
                     """UPDATE memories
@@ -249,7 +243,7 @@ async def stage_reflect(db: asyncpg.Connection, max_reflections: int = 5) -> int
                 emb = await get_embedding(insight, config)
                 if emb:
                     now = datetime.now(timezone.utc).isoformat()
-                    es = f"[{','.join(map(str, emb))}]"
+                    es = MemoryRepository.format_vector(emb)
                     await db.execute(
                         """INSERT INTO memories
                            (id, agent_id, content, embedding, memory_type, importance, created_at, updated_at)

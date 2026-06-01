@@ -35,9 +35,10 @@ async def init_pool(config: Config | None = None) -> asyncpg.Pool:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
         await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
 
-        # Add expires_at column for temporal TTL
+        # Add columns for full Memory API v2 functionality
         await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ")
         await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_relations_count INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS session_id UUID")
 
         # Create memory_relations table for graph relations (no conflict - already exists)
         await conn.execute("""

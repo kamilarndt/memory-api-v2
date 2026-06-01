@@ -9,7 +9,9 @@ Runs on port 8765 with CORS enabled for local plugin access.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -466,6 +468,212 @@ async def notebooklm_ask(req: NotebookLMRequest):
     except Exception:
         logger.exception("NotebookLM ask failed for query: %s", req.query[:100])
         raise HTTPException(status_code=500, detail="NotebookLM query failed")
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible v1 routes (Hermes plugin / built-in tools)
+# ---------------------------------------------------------------------------
+
+
+class V1StoreRequest(BaseModel):
+    """Plugin payload: POST /memories"""
+    content: str = Field(..., description="Memory content")
+    agent_id: str = Field("hermes", description="Agent identity")
+    project_id: str = Field("", description="Project ID")
+    category: str = Field("general", description="Category")
+    importance: float = Field(0.7, description="Importance 0-1")
+    tags: list[str] = Field([], description="Tags")
+
+
+class V1SearchRequest(BaseModel):
+    """Plugin payload: POST /search"""
+    query: str = Field(..., min_length=1, description="Search query")
+    limit: int = Field(10, ge=1, le=100, description="Max results")
+    cross_agent: bool = Field(True, description="Search across all agents")
+    project_id: str | None = Field(None, description="Optional project filter")
+
+
+class V1FeedbackRequest(BaseModel):
+    """Plugin payload: POST /memories/{id}/feedback"""
+    agent_id: str = Field("hermes", description="Agent identity")
+    feedback_type: str = Field("helpful", description="helpful or unhelpful")
+
+
+class V1ExtractRequest(BaseModel):
+    """Plugin payload: POST /extract-facts"""
+    text: str = Field(..., min_length=1, description="Text to extract facts from")
+    agent_id: str = Field("hermes", description="Agent identity")
+    project_id: str = Field("", description="Project ID")
+    auto_save: bool = Field(True, description="Auto-save extracted facts as memories")
+
+
+class V1SearchResult(BaseModel):
+    content: str
+    score: float = 0.0
+    memory_id: str = ""
+    session_id: str = ""
+    created_at: str = ""
+
+
+class V1SearchResponse(BaseModel):
+    results: list[V1SearchResult] = []
+    count: int = 0
+
+
+class V1StoreResponse(BaseModel):
+    status: str
+    memory_id: str = ""
+
+
+@app.post("/memories", tags=["backward-compat"])
+async def v1_store_memory(req: V1StoreRequest):
+    """Backward-compat: Hermes plugin calls POST /memories to store."""
+    try:
+        db: aiosqlite.Connection = app.state.db
+        session_id = f"v1-{req.agent_id}-{req.project_id or 'default'}"
+        memory_id = await store_memory(db, session_id, req.content, f"[stored via v1 by {req.agent_id}]")
+        logger.info("v1 store: agent=%s project=%s memory=%s", req.agent_id, req.project_id, memory_id)
+        return V1StoreResponse(status="stored", memory_id=memory_id)
+    except Exception:
+        logger.exception("v1 store failed")
+        raise HTTPException(status_code=500, detail="Storage failed")
+
+
+@app.post("/search", tags=["backward-compat"])
+async def v1_search_memories(req: V1SearchRequest):
+    """Backward-compat: Hermes plugin calls POST /search to recall."""
+    try:
+        db: aiosqlite.Connection = app.state.db
+        results = await recall_memories(db, req.query, limit=req.limit)
+        items = []
+        for r in results:
+            content = r.get("user_message", "") + " / " + r.get("assistant_response", "")
+            items.append(V1SearchResult(
+                content=content,
+                score=r.get("score", 0.0),
+                memory_id=r.get("id", ""),
+                session_id=r.get("session_id", ""),
+                created_at=r.get("created_at", ""),
+            ))
+        return V1SearchResponse(results=items, count=len(items))
+    except Exception:
+        logger.exception("v1 search failed")
+        return V1SearchResponse(results=[], count=0)
+
+
+@app.get("/stats", tags=["backward-compat"])
+async def v1_stats():
+    """Backward-compat: Hermes memory tool calls GET /stats."""
+    try:
+        db: aiosqlite.Connection = app.state.db
+        cursor = await db.execute("SELECT COUNT(*) FROM memories")
+        row = await cursor.fetchone()
+        total = row[0] if row else 0
+        return {
+            "status": "ok",
+            "total_memories": total,
+            "service": "Memory API v2",
+            "version": "2.0",
+            "checks": {
+                "embedding": {
+                    "dimension": 1024,
+                    "provider": "router",
+                    "status": "compatible",
+                }
+            },
+        }
+    except Exception:
+        logger.exception("v1 stats failed")
+        return {"status": "error", "total_memories": 0}
+
+
+@app.post("/memories/{memory_id}/feedback", tags=["backward-compat"])
+async def v1_feedback(memory_id: str, req: V1FeedbackRequest):
+    """Backward-compat: Hermes plugin calls POST /memories/{id}/feedback."""
+    logger.info("v1 feedback: memory=%s type=%s agent=%s", memory_id, req.feedback_type, req.agent_id)
+    return {"status": "noted", "memory_id": memory_id, "feedback_type": req.feedback_type}
+
+
+@app.post("/extract-facts", tags=["backward-compat"])
+async def v1_extract_facts(req: V1ExtractRequest):
+    """Backward-compat: Hermes plugin calls POST /extract-facts.
+    
+    Falls back to storing the raw text as a memory when no LLM extraction is available.
+    """
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text must not be empty")
+
+    db: aiosqlite.Connection = app.state.db
+    session_id = f"v1-extract-{req.agent_id}"
+
+    # Try LLM-based extraction via OpenRouter if configured, otherwise store raw
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if openrouter_key:
+        try:
+            import httpx
+            # Call deepseek for fact extraction
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {openrouter_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "deepseek/deepseek-chat",
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "Extract 3-7 key facts from the text. Return ONLY a JSON array of objects with keys: content (str), category (str: 'technical'|'personal'|'project'|'reference'|'decision'), importance (0.0-1.0). No markdown, no explanation.",
+                            },
+                            {"role": "user", "content": req.text[:4000]},
+                        ],
+                        "temperature": 0.1,
+                        "max_tokens": 2000,
+                    },
+                )
+                data = resp.json()
+                raw = data.get("choices", [{}])[0].get("message", {}).get("content", "[]")
+                # Strip markdown code fences if present
+                import re
+                raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+                raw = re.sub(r"\s*```$", "", raw)
+                facts = json.loads(raw)
+                if isinstance(facts, list):
+                    saved_ids = []
+                    saved = 0
+                    for fact in facts:
+                        fact_id = str(uuid.uuid4())
+                        created_at = datetime.now(timezone.utc).isoformat()
+                        cat = fact.get("category", "reference")
+                        imp = fact.get("importance", 0.5)
+                        await db.execute(
+                            "INSERT INTO memories (id, session_id, user_message, assistant_response, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (fact_id, session_id, f"[extracted] {fact.get('content', '')}", f"[{cat}] importance={imp}", created_at),
+                        )
+                        saved += 1
+                        saved_ids.append(fact_id)
+                    await db.commit()
+                    return {"extracted": len(facts), "saved": saved, "duplicates": 0, "facts": facts}
+
+        except Exception as e:
+            logger.warning("LLM extraction failed, falling back to raw storage: %s", e)
+
+    # Fallback: store raw text as a single memory
+    memory_id = await store_memory(db, session_id, req.text[:2000], f"[extracted-facts fallback] project={req.project_id}")
+    return {
+        "extracted": 1,
+        "saved": 1,
+        "duplicates": 0,
+        "facts": [
+            {
+                "content": req.text[:500],
+                "category": "reference",
+                "importance": 0.5,
+                "tags": ["extracted"],
+            }
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

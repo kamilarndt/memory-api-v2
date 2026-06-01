@@ -1,12 +1,19 @@
-"""Memory API v2 — Legacy alias endpoints for Pi Agent compatibility."""
+"""Memory API v2 — Legacy alias endpoints for Pi Agent compatibility.
+
+All database operations are delegated to MemoryRepository to eliminate
+duplicated SQL and vector formatting logic.
+"""
 
 from __future__ import annotations
 
+import uuid
 from typing import Optional
-import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+
+from fastapi import APIRouter, Depends, HTTPException, Body
+
 from core import get_config, get_embedding, verify_token
 from db import get_db
+from repositories.memory import MemoryRepository
 
 router = APIRouter(tags=["pi-compat"])
 
@@ -20,35 +27,32 @@ async def pi_remember(
     category: str = Body(default="general", embed=True),
     importance: float = Body(default=0.5, embed=True),
     tags: str = Body(default="", embed=True),
-    db: asyncpg.Connection = Depends(get_db),
+    db=Depends(get_db),
     _: None = Depends(verify_token),
 ):
     """Save a fact with pi_memory_key — legacy endpoint for Pi Agent."""
     config = get_config()
+    repo = MemoryRepository()
+
     emb = await get_embedding(content, config)
     if not emb:
         raise HTTPException(500, "Embedding failed")
 
-    es = f"[{','.join(str(v) for v in emb)}]"
     tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+    memory_type = "lesson" if pi_memory_key.startswith("lesson") else "factual"
 
-    # Dedup
-    existing = await db.fetchrow(
-        "SELECT id FROM memories WHERE 1 - (embedding <=> $1::vector) > 0.95 AND archived_at IS NULL LIMIT 1",
-        es,
-    )
+    # Dedup by semantic similarity (existing pi-agent behavior: reject duplicates)
+    existing = await repo.check_semantic_duplicate(db, emb)
     if existing:
-        return {"status": "duplicate", "existing_id": str(existing["id"])}
+        return {"status": "duplicate", "existing_id": existing}
 
-    import uuid
     mid = str(uuid.uuid4())
-    await db.execute(
-        "INSERT INTO memories (id, content, embedding, agent_id, project_id, user_id, "
-        "category, tags, importance, memory_type, pi_memory_key, created_at) "
-        "VALUES ($1, $2, $3::vector, $4, $5, $6, $7, $8, $9, $10, $11, NOW())",
-        mid, content, es, agent_id, project_id, "default",
-        category, tag_list, importance, "lesson" if pi_memory_key.startswith("lesson") else "factual",
-        pi_memory_key,
+    await repo.insert_memory(
+        conn=db, mid=mid, content=content, emb=emb,
+        agent_id=agent_id, project_id=project_id,
+        user_id="default", category=category, tags=tag_list,
+        importance=importance, memory_type=memory_type,
+        pi_memory_key=pi_memory_key,
     )
     return {"status": "added", "id": mid, "pi_memory_key": pi_memory_key}
 
@@ -58,59 +62,24 @@ async def pi_search(
     query: str = Body(..., embed=True),
     pi_memory_key: str = Body(default="", embed=True),
     limit: int = Body(default=5, embed=True),
-    db: asyncpg.Connection = Depends(get_db),
+    db=Depends(get_db),
 ):
-    """Search memories with optional pi_memory_key filter."""
+    """Search memories with optional pi_memory_key filter (wildcard supported)."""
     config = get_config()
+    repo = MemoryRepository()
+
     emb = await get_embedding(query, config)
     if not emb:
         raise HTTPException(500, "Embedding failed")
 
-    es = f"[{','.join(str(v) for v in emb)}]"
-    where = "m.archived_at IS NULL AND m.embedding IS NOT NULL"
-    params: list = []
-    i = 1
-
-    if pi_memory_key:
-        # Support wildcard: "lesson.*" → LIKE 'lesson.%'
-        if pi_memory_key.endswith(".*"):
-            where += f" AND m.pi_memory_key LIKE ${i}"
-            params.append(pi_memory_key.replace(".*", ".%"))
-        else:
-            where += f" AND m.pi_memory_key = ${i}"
-            params.append(pi_memory_key)
-        i += 1
-
-    rows = await db.fetch(
-        f"""
-        WITH semantic_raw AS (
-            SELECT m.id,
-                   1 - (m.embedding <=> ${i}::vector) as cosine_sim
-            FROM memories m WHERE {where}
-            ORDER BY cosine_sim DESC LIMIT 50
-        ),
-        keyword_search AS (
-            SELECT m.id, ROW_NUMBER() OVER (ORDER BY ts_rank(m.tsv, websearch_to_tsquery('simple', ${i+1})) DESC) as rank
-            FROM memories m WHERE m.tsv @@ websearch_to_tsquery('simple', ${i+1}) AND {where} LIMIT 50
-        )
-        SELECT m.id, m.content, m.category, m.agent_id, m.project_id, m.pi_memory_key,
-               m.tags, m.trust_score, m.created_at,
-               s.cosine_sim,
-               COALESCE(1.0 / (10.0 + k.rank), 0.0) as kw_score
-        FROM semantic_raw s
-        LEFT JOIN keyword_search k ON s.id = k.id
-        JOIN memories m ON m.id = s.id
-        ORDER BY GREATEST(s.cosine_sim, COALESCE(1.0 / (10.0 + k.rank), 0.0)) DESC
-        LIMIT ${i+2}
-        """,
-        *(params + [es, query, limit]),
-    )
+    rows = await repo.search_by_pi_key(db, emb, query, pi_memory_key, limit)
 
     results = []
     for r in rows:
         d = dict(r)
-        d["excerpt"] = (d["content"][:300] + "..." if len(d["content"]) >= 300 else d["content"])
-        # confidence = max(cosine_sim, kw_score) — daje 0.0-1.0 zamiast RRF 0.0-0.033
+        d["excerpt"] = (
+            d["content"][:300] + "..." if len(d["content"]) >= 300 else d["content"]
+        )
         raw_cosine = d.pop("cosine_sim", None)
         raw_kw = d.pop("kw_score", None)
         cosine = float(raw_cosine) if raw_cosine is not None else 0.0
@@ -127,31 +96,28 @@ async def save_fact(
     pi_memory_key: str = Body(default="", alias="key", embed=True),
     agent_id: str = Body(default="pi-agent", embed=True),
     category: str = Body(default="lesson", embed=True),
-    db: asyncpg.Connection = Depends(get_db),
+    db=Depends(get_db),
     _: None = Depends(verify_token),
 ):
-    """Legacy save_fact — redirects to pi-remember logic."""
+    """Legacy save_fact — delegates to pi-remember logic via repository."""
     config = get_config()
+    repo = MemoryRepository()
+
     emb = await get_embedding(content, config)
     if not emb:
         raise HTTPException(500, "Embedding failed")
 
-    es = f"[{','.join(str(v) for v in emb)}]"
-    existing = await db.fetchrow(
-        "SELECT id FROM memories WHERE 1 - (embedding <=> $1::vector) > 0.95 AND archived_at IS NULL LIMIT 1",
-        es,
-    )
+    existing = await repo.check_semantic_duplicate(db, emb)
     if existing:
-        return {"status": "duplicate", "existing_id": str(existing["id"])}
+        return {"status": "duplicate", "existing_id": existing}
 
-    import uuid
     mid = str(uuid.uuid4())
-    await db.execute(
-        "INSERT INTO memories (id, content, embedding, agent_id, project_id, user_id, "
-        "category, tags, importance, memory_type, pi_memory_key, created_at) "
-        "VALUES ($1, $2, $3::vector, $4, $5, $6, $7, $8, $9, $10, $11, NOW())",
-        mid, content, es, agent_id, "", "default",
-        category, [], 0.5, "factual", pi_memory_key,
+    await repo.insert_memory(
+        conn=db, mid=mid, content=content, emb=emb,
+        agent_id=agent_id, project_id="",
+        user_id="default", category=category, tags=[],
+        importance=0.5, memory_type="factual",
+        pi_memory_key=pi_memory_key,
     )
     return {"status": "saved", "id": mid, "pi_memory_key": pi_memory_key}
 

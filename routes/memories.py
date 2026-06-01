@@ -1,4 +1,9 @@
-"""Memory API v2 — Memory CRUD + Search routes."""
+"""Memory API v2 — Memory CRUD + Search routes.
+
+Router handlers focus on HTTP protocol only. All database operations
+are delegated to MemoryRepository. Prompts are isolated in
+repositories/prompts.py.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +12,13 @@ import logging
 import uuid
 from typing import Optional
 
-import asyncpg
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from core import Config, get_config, get_embedding, verify_token
+from core import get_config, get_embedding, verify_token
 from db import get_db
+from repositories.memory import MemoryRepository
+from repositories.prompts import ENTITY_EXTRACTION_SYSTEM
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +27,7 @@ router = APIRouter(prefix="/memories", tags=["memories"])
 
 # ── Models (Pydantic) ────────────────────────────────────────────────────────
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 
 
 class AddMemoryRequest(BaseModel):
@@ -33,10 +39,10 @@ class AddMemoryRequest(BaseModel):
     user_id: str = "default"
     importance: float = 0.5
     memory_type: str = "factual"
-    pi_memory_key: str = ""  # e.g. "pref.commit_style", "lesson.dont_use_echo"
+    pi_memory_key: str = ""
     session_id: Optional[str] = None
-    expires_in_hours: Optional[int] = None  # TTL; None = never expires
-    extract: bool = False  # auto-extract entities via LLM on save
+    expires_in_hours: Optional[int] = None
+    extract: bool = False
 
 
 class SearchRequest(BaseModel):
@@ -46,7 +52,7 @@ class SearchRequest(BaseModel):
     category: Optional[str] = None
     limit: int = 5
     cross_agent: bool = True
-    compact: bool = False  # compact results (no content/excerpt)
+    compact: bool = False
 
 
 class CompositionalSearchRequest(BaseModel):
@@ -65,7 +71,7 @@ class UpdateMemoryRequest(BaseModel):
 
 class FeedbackRequest(BaseModel):
     agent_id: str
-    feedback_type: str  # helpful | not_helpful | incorrect | outdated
+    feedback_type: str
     comment: str = ""
 
 
@@ -78,279 +84,46 @@ class ExtractFactsRequest(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _emb_str(emb: list[float]) -> str:
-    return f"[{','.join(str(v) for v in emb)}]"
 
+async def _extract_entities(content: str, openrouter_key: str) -> list[str]:
+    """Isolated helper: call OpenRouter for entity extraction.
 
-def _serialize_row(row: dict) -> dict:
-    """Convert asyncpg Record to plain dict, removing heavy fields."""
-    d = dict(row)
-    d.pop("embedding", None)
-    if "tsv" in d:
-        d.pop("tsv")
-    # Convert arrays/timestamps to plain types
-    for k, v in d.items():
-        if isinstance(v, (set, frozenset)):
-            d[k] = list(v)
-    return d
-
-
-async def _check_duplicate(
-    db: asyncpg.Connection, emb: list[float], threshold: float = 0.95,
-) -> Optional[str]:
-    """Return existing memory ID if duplicate found."""
-    es = _emb_str(emb)
-    row = await db.fetchrow(
-        "SELECT id FROM memories "
-        "WHERE 1 - (embedding <=> $1::vector) > $2 AND archived_at IS NULL "
-        "LIMIT 1",
-        es, threshold,
-    )
-    return row["id"] if row else None
-
-
-async def _find_by_pi_key(
-    db: asyncpg.Connection,
-    pi_memory_key: str,
-    agent_id: str,
-    project_id: str,
-) -> Optional[str]:
-    """Return existing memory ID if pi_memory_key match found."""
-    if not pi_memory_key:
-        return None
-    row = await db.fetchrow(
-        "SELECT id FROM memories "
-        "WHERE pi_memory_key = $1 AND agent_id = $2 AND project_id = $3 AND archived_at IS NULL "
-        "LIMIT 1",
-        pi_memory_key, agent_id, project_id,
-    )
-    return row["id"] if row else None
-
-
-# ── CRUD ─────────────────────────────────────────────────────────────────────
-
-@router.post("", summary="Add a memory")
-async def add_memory(
-    req: AddMemoryRequest,
-    db: asyncpg.Connection = Depends(get_db),
-    _: None = Depends(verify_token),
-):
-    config = get_config()
-    emb = await get_embedding(req.content, config)
-    if not emb:
-        raise HTTPException(500, "Embedding generation failed")
-
-    # ── Upsert by pi_memory_key (before semantic dedup) ──────────────
-    if req.pi_memory_key:
-        existing = await _find_by_pi_key(db, req.pi_memory_key, req.agent_id, req.project_id)
-        if existing:
-            await db.execute(
-                """UPDATE memories SET
-                   content = $1,
-                   session_id = COALESCE($2, session_id),
-                   updated_at = NOW(),
-                   access_count = COALESCE(access_count, 0) + 1
-                   WHERE id = $3""",
-                req.content, req.session_id, existing,
+    Returns empty list on any failure — entity extraction is best-effort.
+    """
+    if not openrouter_key or not content:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openrouter_key}",
+                    "HTTP-Referer": "http://localhost:8766",
+                    "X-Title": "Memory API v2",
+                },
+                json={
+                    "model": "deepseek/deepseek-chat",
+                    "messages": [
+                        {"role": "system", "content": ENTITY_EXTRACTION_SYSTEM},
+                        {"role": "user", "content": content},
+                    ],
+                    "max_tokens": 200,
+                },
             )
-            if req.expires_in_hours:
-                await db.execute(
-                    "UPDATE memories SET expires_at = NOW() + make_interval(hours => $1) WHERE id = $2",
-                    req.expires_in_hours, existing,
-                )
-            return {"status": "updated", "id": str(existing), "revision": True}
-
-    # Dedup check — merge instead of reject
-    existing = await _check_duplicate(db, emb)
-    if existing:
-        await db.execute(
-            """UPDATE memories SET
-               content = $1,
-               session_id = COALESCE($2, session_id),
-               updated_at = NOW(),
-               access_count = COALESCE(access_count, 0) + 1
-               WHERE id = $3""",
-            req.content, req.session_id, existing,
-        )
-        # Update expires_at if requested
-        if req.expires_in_hours:
-            await db.execute(
-                "UPDATE memories SET expires_at = NOW() + make_interval(hours => $1) WHERE id = $2",
-                req.expires_in_hours, existing,
-            )
-        return {"status": "updated", "id": str(existing), "agent_id": req.agent_id}
-
-    mid = str(uuid.uuid4())
-    es = _emb_str(emb)
-
-    await db.execute(
-        """INSERT INTO memories
-           (id, content, embedding, agent_id, project_id, user_id, category, tags,
-            importance, memory_type, pi_memory_key, session_id, expires_at, created_at)
-           VALUES ($1, $2, $3::vector, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                   CASE WHEN $13::int IS NOT NULL THEN NOW() + make_interval(hours => $13) ELSE NULL END,
-                   NOW())""",
-        mid, req.content, es, req.agent_id, req.project_id,
-        req.user_id, req.category, req.tags, req.importance, req.memory_type,
-        req.pi_memory_key, req.session_id, req.expires_in_hours,
-    )
-
-    # Auto-extract entities via LLM if requested
-    if req.extract and req.content:
-        config = get_config()
-        if config.openrouter_key:
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {config.openrouter_key}"},
-                        json={
-                            "model": "openai/gpt-4o-mini:free",
-                            "messages": [
-                                {"role": "system", "content": "Extract key entities (people, places, concepts, projects) from this text. Return ONLY a JSON array of strings."},
-                                {"role": "user", "content": req.content},
-                            ],
-                            "max_tokens": 200,
-                        },
-                    )
-                    text = resp.json()["choices"][0]["message"]["content"].strip()
-                    if text.startswith("["):
-                        entities = json.loads(text)
-                        if entities:
-                            await db.execute(
-                                "UPDATE memories SET entities = $1::jsonb WHERE id = $2",
-                                json.dumps(entities), mid,
-                            )
-            except Exception as e:
-                logger.warning("Auto-extract failed: %s", e)
-
-    return {"status": "added", "id": mid, "agent_id": req.agent_id}
-
-
-@router.get("", summary="List memories with filters")
-async def list_memories(
-    agent_id: Optional[str] = Query(None),
-    project_id: Optional[str] = Query(None),
-    category: Optional[str] = Query(None),
-    memory_type: Optional[str] = Query(None),
-    limit: int = Query(default=20, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
-    db: asyncpg.Connection = Depends(get_db),
-):
-    wheres = ["archived_at IS NULL"]
-    params: list = []
-    i = 1
-
-    for col, val in [("agent_id", agent_id), ("project_id", project_id),
-                     ("category", category), ("memory_type", memory_type)]:
-        if val:
-            wheres.append(f"{col} = ${i}")
-            params.append(val)
-            i += 1
-
-    where = " AND ".join(wheres)
-    params.extend([limit, offset])
-
-    rows = await db.fetch(
-        f"SELECT id, content, category, agent_id, project_id, user_id, tags, "
-        f"source_file, importance, trust_score, memory_type, created_at "
-        f"FROM memories WHERE {where} ORDER BY created_at DESC LIMIT ${i} OFFSET ${i+1}",
-        *params,
-    )
-    return {"memories": [_serialize_row(dict(r)) for r in rows], "count": len(rows)}
-
-
-@router.get("/{memory_id}", summary="Get single memory")
-async def get_memory(
-    memory_id: str,
-    db: asyncpg.Connection = Depends(get_db),
-):
-    row = await db.fetchrow(
-        "SELECT * FROM memories WHERE id = $1", memory_id,
-    )
-    if not row:
-        raise HTTPException(404, "Memory not found")
-    return {"memory": _serialize_row(dict(row))}
-
-
-@router.put("/{memory_id}", summary="Update memory (agent must own)")
-async def update_memory(
-    memory_id: str,
-    req: UpdateMemoryRequest,
-    db: asyncpg.Connection = Depends(get_db),
-    _: None = Depends(verify_token),
-):
-    fields = []
-    params: list = []
-    i = 1
-
-    for col in ("content", "category", "project_id", "importance", "memory_type"):
-        val = getattr(req, col)
-        if val is not None:
-            fields.append(f"{col} = ${i}")
-            params.append(val)
-            i += 1
-
-    if req.tags is not None:
-        fields.append(f"tags = ${i}")
-        params.append(req.tags)
-        i += 1
-
-    if not fields:
-        raise HTTPException(400, "No fields to update")
-
-    fields.append("updated_at = NOW()")
-    params.append(memory_id)
-
-    row = await db.fetchrow(
-        f"UPDATE memories SET {', '.join(fields)} "
-        f"WHERE id = ${i} AND archived_at IS NULL "
-        f"RETURNING id, content, category, agent_id, project_id, importance, memory_type",
-        *params,
-    )
-    if not row:
-        raise HTTPException(404, "Memory not found or archived")
-    return {"status": "updated", "memory": dict(row)}
-
-
-@router.delete("/{memory_id}", summary="Soft delete memory (agent must own)")
-async def delete_memory(
-    memory_id: str,
-    db: asyncpg.Connection = Depends(get_db),
-    _: None = Depends(verify_token),
-):
-    result = await db.execute(
-        "UPDATE memories SET archived_at = NOW() WHERE id = $1 AND archived_at IS NULL",
-        memory_id,
-    )
-    if result == "UPDATE 0":
-        raise HTTPException(404, "Memory not found or already archived")
-    return {"status": "archived", "memory_id": memory_id}
-
-
-# ── Full Memory Detail ───────────────────────────────────────────────────────
-
-@router.get("/{memory_id}/full", summary="Get full memory detail (public)")
-async def get_memory_full(
-    memory_id: str,
-    db: asyncpg.Connection = Depends(get_db),
-):
-    """Return full record (without embedding/tsv) plus relations_count. Public endpoint."""
-    row = await db.fetchrow(
-        """SELECT id, content, agent_id, project_id, user_id, category, tags,
-                  source_file, importance, trust_score, memory_type, pi_memory_key,
-                  session_id, entities, access_count, expires_at, created_at, updated_at,
-                  archived_at, memory_relations_count
-           FROM memories
-           WHERE id = $1""",
-        memory_id,
-    )
-    if not row:
-        raise HTTPException(404, "Memory not found")
-    return {"memory": _serialize_row(dict(row))}
+            text = resp.json()["choices"][0]["message"]["content"].strip()
+            # Strip markdown code block fences if present
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1] if "\n" in text else text.replace("```json", "").replace("```", "")
+                text = text.strip().removesuffix("```").strip()
+            if text.startswith("[") and text.endswith("]"):
+                return json.loads(text)
+    except Exception as e:
+        logger.warning("Entity extraction failed (non-blocking): %s", e)
+    return []
 
 
 # ── Compact List ─────────────────────────────────────────────────────────────
+
 
 @router.get("/compact", summary="List memories compact (public)")
 async def list_memories_compact(
@@ -359,9 +132,9 @@ async def list_memories_compact(
     memory_type: Optional[str] = Query(None),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    db: asyncpg.Connection = Depends(get_db),
+    db=Depends(get_db),
 ):
-    """List memories with compact fields only. Public endpoint. Sorted by created_at DESC."""
+    """List memories with compact fields only. Public endpoint."""
     wheres = ["archived_at IS NULL"]
     params: list = []
     i = 1
@@ -390,6 +163,225 @@ async def list_memories_compact(
     return {"memories": results, "count": len(results)}
 
 
+# ── CRUD ─────────────────────────────────────────────────────────────────────
+
+
+@router.post("", summary="Add a memory")
+async def add_memory(
+    req: AddMemoryRequest,
+    db=Depends(get_db),
+    _: None = Depends(verify_token),
+):
+    """Create or update a memory with semantic dedup and optional entity extraction."""
+    config = get_config()
+    repo = MemoryRepository()
+
+    # 1. Embed
+    emb = await get_embedding(req.content, config)
+    if not emb:
+        raise HTTPException(500, "Embedding generation failed")
+
+    # 2. Upsert by pi_memory_key (exact match, highest priority)
+    if req.pi_memory_key:
+        existing = await repo.find_by_pi_key(db, req.pi_memory_key, req.agent_id, req.project_id)
+        if existing:
+            await repo.inline_upsert_memory(db, existing, req.content, req.session_id, req.expires_in_hours)
+            return {"status": "updated", "id": existing, "revision": True}
+
+    # 3. Semantic dedup — merge instead of reject
+    existing = await repo.check_semantic_duplicate(db, emb)
+    if existing:
+        await repo.inline_upsert_memory(db, existing, req.content, req.session_id, req.expires_in_hours)
+        return {"status": "updated", "id": existing, "agent_id": req.agent_id}
+
+    # 4. Fresh insert
+    mid = str(uuid.uuid4())
+    await repo.insert_memory(
+        conn=db, mid=mid, content=req.content, emb=emb,
+        agent_id=req.agent_id, project_id=req.project_id,
+        user_id=req.user_id, category=req.category, tags=req.tags,
+        importance=req.importance, memory_type=req.memory_type,
+        pi_memory_key=req.pi_memory_key, session_id=req.session_id,
+        expires_in_hours=req.expires_in_hours,
+    )
+
+    # 5. Conditional entity enrichment
+    if req.extract:
+        entities = await _extract_entities(req.content, config.openrouter_key)
+        if entities:
+            await repo.update_entities(db, mid, entities)
+
+    return {"status": "added", "id": mid, "agent_id": req.agent_id}
+
+
+@router.get("", summary="List memories with filters")
+async def list_memories(
+    agent_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    memory_type: Optional[str] = Query(None),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db=Depends(get_db),
+):
+    """List active memories with optional filters."""
+    repo = MemoryRepository()
+    wheres = ["archived_at IS NULL"]
+    params: list = []
+    i = 1
+
+    for col, val in [("agent_id", agent_id), ("project_id", project_id),
+                     ("category", category), ("memory_type", memory_type)]:
+        if val:
+            wheres.append(f"{col} = ${i}")
+            params.append(val)
+            i += 1
+
+    where = " AND ".join(wheres)
+    params.extend([limit, offset])
+
+    rows = await db.fetch(
+        f"SELECT id, content, category, agent_id, project_id, user_id, tags, "
+        f"source_file, importance, trust_score, memory_type, created_at "
+        f"FROM memories WHERE {where} ORDER BY created_at DESC LIMIT ${i} OFFSET ${i+1}",
+        *params,
+    )
+    return {
+        "memories": [repo.serialize_row(dict(r)) for r in rows],
+        "count": len(rows),
+    }
+
+
+@router.get("/{memory_id}", summary="Get single memory")
+async def get_memory(
+    memory_id: str,
+    db=Depends(get_db),
+):
+    """Fetch a single memory by ID."""
+    repo = MemoryRepository()
+    row = await repo.get_by_id(db, memory_id)
+    if not row:
+        raise HTTPException(404, "Memory not found")
+    return {"memory": repo.serialize_row(row)}
+
+
+@router.put("/{memory_id}", summary="Update memory (agent must own)")
+async def update_memory(
+    memory_id: str,
+    req: UpdateMemoryRequest,
+    db=Depends(get_db),
+    _: None = Depends(verify_token),
+):
+    """Update specific fields on a memory."""
+    repo = MemoryRepository()
+    updates = {}
+    for col in ("content", "category", "project_id", "importance", "memory_type"):
+        val = getattr(req, col)
+        if val is not None:
+            updates[col] = val
+    if req.tags is not None:
+        updates["tags"] = req.tags
+
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+
+    updated = await repo.update_memory_fields(db, memory_id, **updates)
+    if not updated:
+        raise HTTPException(404, "Memory not found or archived")
+    return {"status": "updated", "memory": updated}
+
+
+@router.delete("/{memory_id}", summary="Soft delete memory (agent must own)")
+async def delete_memory(
+    memory_id: str,
+    db=Depends(get_db),
+    _: None = Depends(verify_token),
+):
+    """Archive (soft-delete) a memory."""
+    repo = MemoryRepository()
+    if not await repo.soft_delete(db, memory_id):
+        raise HTTPException(404, "Memory not found or already archived")
+    return {"status": "archived", "memory_id": memory_id}
+
+
+@router.post("/{memory_id}/feedback", summary="Submit feedback on a memory")
+async def submit_feedback(
+    memory_id: str,
+    req: FeedbackRequest,
+    db=Depends(get_db),
+    _: None = Depends(verify_token),
+):
+    """Update trust_score based on feedback type.
+
+    - helpful   → trust_score = 1.0
+    - unhelpful → trust_score = 0.5
+    - incorrect → trust_score = 0.0
+    - outdated  → trust_score = 0.3
+    """
+    repo = MemoryRepository()
+
+    # Verify memory exists
+    row = await repo.get_by_id(db, memory_id)
+    if not row:
+        raise HTTPException(404, "Memory not found")
+
+    # Map feedback type to trust score
+    trust_map = {
+        "helpful": 1.0,
+        "unhelpful": 0.5,
+        "incorrect": 0.0,
+        "outdated": 0.3,
+    }
+    if req.feedback_type not in trust_map:
+        raise HTTPException(
+            400,
+            f"Invalid feedback_type '{req.feedback_type}'. "
+            f"Must be one of: {', '.join(trust_map)}",
+        )
+
+    new_trust = trust_map[req.feedback_type]
+    updated = await repo.update_memory_fields(
+        db, memory_id, trust_score=new_trust,
+    )
+    if not updated:
+        raise HTTPException(404, "Memory not found or archived")
+
+    logger.info(
+        "Feedback %s on memory %s by agent %s — trust_score → %.1f",
+        req.feedback_type, memory_id, req.agent_id, new_trust,
+    )
+
+    return {
+        "status": "ok",
+        "memory_id": memory_id,
+        "new_trust_score": new_trust,
+    }
+
+
+# ── Full Memory Detail ───────────────────────────────────────────────────────
+
+
+@router.get("/{memory_id}/full", summary="Get full memory detail (public)")
+async def get_memory_full(
+    memory_id: str,
+    db=Depends(get_db),
+):
+    """Return full record (without embedding/tsv) plus relations_count. Public."""
+    repo = MemoryRepository()
+    row = await db.fetchrow(
+        """SELECT id, content, agent_id, project_id, user_id, category, tags,
+                  source_file, importance, trust_score, memory_type, pi_memory_key,
+                  session_id, entities, access_count, expires_at, created_at, updated_at,
+                  archived_at, memory_relations_count
+           FROM memories
+           WHERE id = $1""",
+        memory_id,
+    )
+    if not row:
+        raise HTTPException(404, "Memory not found")
+    return {"memory": repo.serialize_row(dict(row))}
+
+
 # ── Search ───────────────────────────────────────────────────────────────────
 
 search_router = APIRouter(tags=["search"])
@@ -398,66 +390,27 @@ search_router = APIRouter(tags=["search"])
 @search_router.post("/search", summary="Hybrid search: semantic + keyword (RRF)")
 async def search_memories(
     req: SearchRequest,
-    db: asyncpg.Connection = Depends(get_db),
+    db=Depends(get_db),
 ):
+    """Hybrid search with RRF fusion."""
     config = get_config()
     emb = await get_embedding(req.query, config)
     if not emb:
         raise HTTPException(500, "Embedding generation failed")
 
-    es = _emb_str(emb)
-    wheres = ["m.archived_at IS NULL"]
-    params: list = []
-    i = 1
-
-    agent_id = None if req.cross_agent else req.agent_id
-    for col, val in [("m.agent_id", agent_id), ("m.project_id", req.project_id),
-                     ("m.category", req.category)]:
-        if val:
-            wheres.append(f"{col} = ${i}")
-            params.append(val)
-            i += 1
-
-    where = " AND ".join(wheres)
-
-    rows = await db.fetch(
-        f"""
-        WITH semantic_search AS (
-            SELECT m.id,
-                   ROW_NUMBER() OVER (ORDER BY m.embedding <=> ${i}::vector) as rank
-            FROM memories m
-            WHERE {where}
-            LIMIT 50
-        ),
-        keyword_search AS (
-            SELECT m.id,
-                   ROW_NUMBER() OVER (ORDER BY ts_rank(m.tsv, websearch_to_tsquery('english', ${i+1})) DESC) as rank
-            FROM memories m
-            WHERE (m.tsv @@ websearch_to_tsquery('english', ${i+1})
-                   OR similarity(m.content, ${i+1}) > 0.3)
-              AND {where}
-            LIMIT 50
-        )
-        SELECT m.id, m.content, m.category, m.agent_id, m.project_id, m.user_id,
-               m.tags, m.source_file, m.importance, m.trust_score, m.memory_type, m.created_at,
-               m.pi_memory_key,
-               (COALESCE(1.0 / (60 + s.rank), 0.0) + COALESCE(1.0 / (60 + k.rank), 0.0)) as rrf_score
-        FROM semantic_search s
-        FULL OUTER JOIN keyword_search k ON s.id = k.id
-        JOIN memories m ON m.id = COALESCE(s.id, k.id)
-        ORDER BY rrf_score DESC
-        LIMIT ${i+2}
-        """,
-        *(params + [es, req.query, req.limit]),
+    repo = MemoryRepository()
+    rows = await repo.hybrid_search(
+        conn=db, emb=emb, query_text=req.query,
+        agent_id=req.agent_id, project_id=req.project_id,
+        category=req.category, cross_agent=req.cross_agent,
+        limit=req.limit,
     )
 
     results = []
     for r in rows:
         d = dict(r)
         d["confidence"] = round(float(d.pop("rrf_score")), 4)
-
         if req.compact:
-            # Compact mode: only id, pi_memory_key, memory_type, confidence, created_at
             results.append({
                 "id": d["id"],
                 "pi_memory_key": d.get("pi_memory_key") or "",
@@ -466,8 +419,11 @@ async def search_memories(
                 "created_at": d["created_at"],
             })
         else:
-            # Full mode (existing behavior)
-            d["excerpt"] = (d["content"][:300] + "..." if len(d["content"]) >= 300 else d["content"])
+            d["excerpt"] = (
+                d["content"][:300] + "..."
+                if len(d["content"]) >= 300
+                else d["content"]
+            )
             results.append(d)
 
     return {"results": results, "count": len(results)}
@@ -476,85 +432,26 @@ async def search_memories(
 @search_router.post("/search/compositional", summary="Find memories with ALL specified entities")
 async def compositional_search(
     req: CompositionalSearchRequest,
-    db: asyncpg.Connection = Depends(get_db),
+    db=Depends(get_db),
 ):
+    """Find memories containing ALL specified entities (AND logic)."""
     if not req.entities:
         raise HTTPException(400, "entities list required")
-
-    placeholders = ",".join([f"${i+2}" for i in range(len(req.entities))])
-    rows = await db.fetch(
-        f"""
-        SELECT id, content, agent_id, project_id, category, trust_score, importance,
-               entities, memory_type, created_at
-        FROM memories
-        WHERE archived_at IS NULL
-          AND entities::jsonb ?& ARRAY[{placeholders}]
-        ORDER BY trust_score DESC, created_at DESC
-        LIMIT $1
-        """,
-        req.limit, *req.entities,
-    )
-
-    return {"results": [_serialize_row(dict(r)) for r in rows], "count": len(rows)}
+    repo = MemoryRepository()
+    rows = await repo.compositional_search(db, req.entities, req.limit)
+    return {
+        "results": [repo.serialize_row(dict(r)) for r in rows],
+        "count": len(rows),
+    }
 
 
 @search_router.get("/memories/{memory_id}/related", summary="Find related memories")
 async def get_related_memories(
     memory_id: str,
     limit: int = Query(default=10, ge=1, le=50),
-    db: asyncpg.Connection = Depends(get_db),
+    db=Depends(get_db),
 ):
-    row = await db.fetchrow(
-        "SELECT embedding, entities FROM memories WHERE id = $1", memory_id,
-    )
-    if not row:
-        raise HTTPException(404, "Memory not found")
-
-    results = []
-
-    # 1. Entity overlap first
-    entities_val = row["entities"]
-    if entities_val:
-        entities_list = entities_val if isinstance(entities_val, list) else json.loads(entities_val) if isinstance(entities_val, str) else []
-
-        if entities_list:
-            placeholders = ",".join([f"${i+2}" for i in range(len(entities_list))])
-            rows = await db.fetch(
-                f"""
-                SELECT id, content, agent_id, project_id, category, trust_score, created_at
-                FROM memories WHERE id != $1 AND archived_at IS NULL
-                  AND entities::jsonb ?| ARRAY[{placeholders}]
-                ORDER BY trust_score DESC LIMIT ${len(entities_list)+3}
-                """,
-                memory_id, *[str(e) for e in entities_list], limit,
-            )
-            results = [_serialize_row(dict(r)) for r in rows]
-
-    # 2. Semantic similarity fallback
-    if len(results) < limit:
-        emb = row["embedding"]
-        if emb:
-            es = _emb_str(emb) if isinstance(emb, list) else emb
-            existing_ids = [r["id"] for r in results]
-
-            id_filter = ""
-            id_params = []
-            for idx, eid in enumerate(existing_ids):
-                id_filter += f" AND id != ${len(results) + idx + 2}"
-                id_params.append(eid)
-
-            rows = await db.fetch(
-                f"""
-                SELECT id, content, agent_id, project_id, category, trust_score, created_at,
-                       1 - (embedding <=> ${len(results) + len(id_params) + 1}::vector) as similarity
-                FROM memories WHERE id != $1 AND archived_at IS NULL {id_filter}
-                ORDER BY similarity DESC LIMIT ${len(results) + len(id_params) + 2}
-                """,
-                memory_id, *id_params, es, limit - len(results),
-            )
-            for r in rows:
-                d = dict(r)
-                if d["id"] not in existing_ids:
-                    results.append(d)
-
-    return {"results": results[:limit], "count": len(results[:limit])}
+    """Find related memories: entity overlap first, then semantic fallback."""
+    repo = MemoryRepository()
+    results = await repo.get_related(db, memory_id, limit)
+    return {"results": results, "count": len(results)}

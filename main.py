@@ -1,4 +1,9 @@
-"""Memory API v2 — FastAPI application assembly with MCP SSE support."""
+#!/usr/bin/env python3
+"""Memory API v2 — FastAPI application assembly with MCP SSE support.
+
+MCP tool handlers delegate to MemoryRepository for all database operations,
+eliminating the SQL duplication that existed across routes, aliases, and main.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +21,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from core import get_config, get_embedding
 from db import init_pool, close_pool
+from repositories.memory import MemoryRepository
 from routes.memories import router as memories_router, search_router
 from routes.admin import router as admin_router
 from routes.profiles import router as profiles_router
@@ -33,10 +39,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-def _emb_str(emb: list[float]) -> str:
-    """Format embedding vector as pgvector literal."""
-    return f"[{','.join(str(v) for v in emb)}]"
 
 # ---------------------------------------------------------------------------
 # MCP tool implementations (injected with pool at call time)
@@ -99,52 +101,59 @@ MCP_TOOLS = [
 
 
 async def _execute_tool(pool, tool_name: str, arguments: dict) -> dict:
-    """Dispatch MCP tool calls to the appropriate handler."""
+    """Dispatch MCP tool calls to the appropriate handler.
+
+    Uses MemoryRepository for all DB operations — no inline SQL.
+    """
+    repo = MemoryRepository()
+
     if tool_name == "add_memory":
         config = get_config()
         emb = await get_embedding(arguments["content"], config)
-        es = _emb_str(emb) if emb else None
+        if not emb:
+            return {"error": "embedding failed", "id": None}
+
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO memories (agent_id, content, memory_type, importance, embedding)
-                VALUES ($1, $2, $3, $4, $5::vector)
-                RETURNING id, created_at
-                """,
-                arguments["agent_id"],
-                arguments["content"],
-                arguments.get("memory_type"),
-                arguments.get("importance", 0),
-                es,
+            mid = str(uuid.uuid4())
+            await repo.insert_memory(
+                conn=conn, mid=mid, content=arguments["content"],
+                emb=emb, agent_id=arguments["agent_id"],
+                project_id="", user_id="default",
+                category="general", tags=[],
+                importance=arguments.get("importance", 0),
+                memory_type=arguments.get("memory_type", "factual"),
             )
-            return {"id": str(row["id"]), "created_at": row["created_at"].isoformat()}
+            row = await conn.fetchrow(
+                "SELECT id, created_at FROM memories WHERE id = $1", mid,
+            )
+            return {
+                "id": str(row["id"]),
+                "created_at": row["created_at"].isoformat(),
+            }
 
     elif tool_name == "search_memories":
         config = get_config()
         emb = await get_embedding(arguments["query"], config)
         if not emb:
             return {"results": [], "error": "embedding failed"}
-        es = _emb_str(emb)
+
+        es = repo.format_vector(emb)
         limit = int(arguments.get("limit", 10))
         min_score = float(arguments.get("min_score", 0.0))
+
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """
-                SELECT id, content, memory_type, importance,
-                       created_at, updated_at,
-                       1 - (embedding <=> $2::vector) AS similarity
-                FROM memories
-                WHERE agent_id = $1
-                  AND archived_at IS NULL
-                  AND embedding IS NOT NULL
-                  AND 1 - (embedding <=> $2::vector) > $3
-                ORDER BY similarity DESC
-                LIMIT $4
-                """,
-                arguments["agent_id"],
-                es,
-                min_score,
-                limit,
+                """SELECT id, content, memory_type, importance,
+                          created_at, updated_at,
+                          1 - (embedding <=> $2::vector) AS similarity
+                   FROM memories
+                   WHERE agent_id = $1
+                     AND archived_at IS NULL
+                     AND embedding IS NOT NULL
+                     AND 1 - (embedding <=> $2::vector) > $3
+                   ORDER BY similarity DESC
+                   LIMIT $4""",
+                arguments["agent_id"], es, min_score, limit,
             )
             return {
                 "results": [
@@ -163,16 +172,14 @@ async def _execute_tool(pool, tool_name: str, arguments: dict) -> dict:
     elif tool_name == "list_memories":
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """
-                SELECT id, content, memory_type, importance,
-                       created_at, updated_at
-                FROM memories
-                WHERE agent_id = $1
-                  AND archived_at IS NULL
-                  AND ($2::text IS NULL OR memory_type = $2)
-                ORDER BY created_at DESC
-                LIMIT $3
-                """,
+                """SELECT id, content, memory_type, importance,
+                          created_at, updated_at
+                   FROM memories
+                   WHERE agent_id = $1
+                     AND archived_at IS NULL
+                     AND ($2::text IS NULL OR memory_type = $2)
+                   ORDER BY created_at DESC
+                   LIMIT $3""",
                 arguments["agent_id"],
                 arguments.get("memory_type"),
                 arguments.get("limit", 20),
@@ -192,12 +199,8 @@ async def _execute_tool(pool, tool_name: str, arguments: dict) -> dict:
 
     elif tool_name == "forget_memory":
         async with pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE memories SET archived_at = NOW() WHERE id = $1::uuid",
-                arguments["memory_id"],
-            )
-            archived = result.replace("UPDATE ", "")
-            return {"archived": int(archived) > 0}
+            archived = await repo.soft_delete(conn, arguments["memory_id"])
+            return {"archived": archived}
 
     raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -275,12 +278,12 @@ async def root():
 # MCP SSE endpoint — JSON-RPC over Server-Sent Events
 # ---------------------------------------------------------------------------
 
+
 @app.get("/mcp/sse")
 async def mcp_sse(request: Request):
     """SSE endpoint for MCP — streams responses to client."""
     session_id = str(uuid.uuid4())
     queue: _asyncio.Queue = _asyncio.Queue()
-    # Store queue so POST handler can find it
     if not hasattr(app.state, "mcp_queues"):
         app.state.mcp_queues = {}
     app.state.mcp_queues[session_id] = queue
@@ -288,12 +291,10 @@ async def mcp_sse(request: Request):
     logger.info("MCP SSE session started: %s", session_id)
 
     async def event_generator() -> AsyncIterator[dict]:
-        # 1. Send endpoint event
         yield {
             "event": "endpoint",
             "data": f"/mcp/messages/{session_id}",
         }
-        # 2. Stream responses from the queue
         try:
             while True:
                 try:
@@ -330,7 +331,6 @@ async def mcp_messages(session_id: str, request: Request):
 
     logger.info("MCP message: method=%s id=%s session=%s", method, msg_id, session_id)
 
-    # Build JSON-RPC response
     response = None
 
     if method == "initialize":
@@ -366,13 +366,11 @@ async def mcp_messages(session_id: str, request: Request):
     else:
         response = {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
-    # Send response via SSE if session queue exists
     if response:
         queues = getattr(request.app.state, "mcp_queues", {})
         queue = queues.get(session_id)
         if queue:
             await queue.put(response)
-        # Also return directly — Claude Code reads POST body, not just SSE
         return response
 
     return JSONResponse(status_code=202, content="")
