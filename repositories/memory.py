@@ -36,7 +36,7 @@ class MemoryRepository:
         self,
         conn: asyncpg.Connection,
         emb: list[float],
-        threshold: float = 0.95,
+        threshold: float = 0.85,
     ) -> Optional[str]:
         """Return existing memory ID if a semantic duplicate exists."""
         es = self.format_vector(emb)
@@ -206,6 +206,8 @@ class MemoryRepository:
         category: Optional[str] = None,
         cross_agent: bool = True,
         limit: int = 10,
+        min_importance: float = 0.0,
+        exclude_categories: Optional[list[str]] = None,
     ) -> list[dict]:
         """Hybrid search: semantic (cosine) + keyword (ts_rank) with RRF fusion."""
         es = self.format_vector(emb)
@@ -221,6 +223,17 @@ class MemoryRepository:
                 wheres.append(f"{col} = ${i}")
                 params.append(val)
                 i += 1
+
+        if min_importance > 0.0:
+            wheres.append(f"m.importance >= ${i}")
+            params.append(min_importance)
+            i += 1
+
+        if exclude_categories:
+            placeholders = ", ".join(f"${i + j}" for j in range(len(exclude_categories)))
+            wheres.append(f"m.category NOT IN ({placeholders})")
+            params.extend(exclude_categories)
+            i += len(exclude_categories)
 
         where = " AND ".join(wheres)
         rows = await conn.fetch(
