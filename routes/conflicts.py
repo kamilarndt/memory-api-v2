@@ -97,8 +97,24 @@ async def judge_verdict(
     VALID_VERDICTS = {"contradictory", "supportive", "independent", "superseded"}
     if verdict not in VALID_VERDICTS:
         raise HTTPException(400, f"Invalid verdict. Valid: {', '.join(sorted(VALID_VERDICTS))}")
+    
+    # Validate UUID format before DB queries
+    for name, val in [("source_id", source_id), ("target_id", target_id)]:
+        if val is None:
+            raise HTTPException(400, f"Invalid UUID for {name}: None (Python None)")
+        if val == "None":
+            raise HTTPException(400, f"Invalid UUID for {name}: 'None' (string)")
+        if not val:
+            raise HTTPException(400, f"Invalid UUID for {name}: empty")
+        try:
+            uuid.UUID(str(val))
+        except (ValueError, AttributeError) as e:
+            raise HTTPException(400, f"Invalid UUID for {name}: '{val}' - {e}")
 
-    source = await db.fetchval("SELECT id FROM memories WHERE id = $1::uuid", source_id)
+    try:
+        source = await db.fetchval("SELECT id FROM memories WHERE id = $1::uuid", source_id)
+    except Exception as e:
+        raise HTTPException(400, f"Source query failed: {e}")
     if not source:
         raise HTTPException(404, "Source memory not found")
     target = await db.fetchval("SELECT id FROM memories WHERE id = $1::uuid", target_id)
